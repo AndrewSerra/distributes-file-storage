@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package sync;
+option go_package = "github.com/andrewserra/fs-sync/gen/sync";
+
+service FileSynchronizer {
+    // List uploaded files
+    rpc List(ListRequest) returns (ListResponse) {}
+    // Create metadata entry for file
+    rpc PrepareUpload(FileMetaData) returns (PrepareUploadResponse) {}
+    // Add a file
+    rpc Upload(stream FileChunk) returns (UploadResponse) {}
+    // Delete a file
+    rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+    // Send metadata entry for file 
+    rpc PrepareDownload(DownloadRequest) returns (SavedFileMetaData) {}
+    // Get a file
+    rpc Download(DownloadRequest) returns (stream FileChunk) {}
+}
+
+message ListRequest {}
+
+message ListResponse {
+    repeated SavedFileMetaData items = 1;
+}
+
+message FileMetaData {
+    string filename = 1;
+    int64 numChunks = 2;
+}
+
+message PrepareUploadResponse {
+    bool success = 1;
+    oneof payload {
+        string chunkId = 2;
+        string message = 3;
+    }
+}
+
+message FileChunk {
+    string chunkId = 1;
+    int64 chunkOrder = 2;
+    bytes chunk = 3;
+}
+
+message UploadResponse {
+    bool success = 1;
+    optional string message = 2;
+}
+
+message DownloadRequest {
+    string chunkId = 1;
+}
+
+message SavedFileMetaData {
+    string filename = 1;
+    string chunkId = 2;
+    int64 numChunks = 3;
+    string createdAt = 4;
+}
+
+message DeleteRequest {
+    string chunkId = 1;
+}
+
+message DeleteResponse {
+    bool success = 1;
+    optional string message = 2;
+}
+

@@ -1,0 +1,9 @@
+# Proto generated files path
+gen/
+
+# Test documents
+*.pdf
+
+# Test path
+sample-file/
+storage/
