@@ -18,7 +18,7 @@ import (
 
 	"google.golang.org/grpc"
 
-	pb "github.com/AndrewSerra/fs-sync/gen/proto"
+	pb "github.com/AndrewSerra/fs-sync/gen/proto/file"
 	"github.com/AndrewSerra/fs-sync/internal/chunk"
 	"github.com/google/uuid"
 )

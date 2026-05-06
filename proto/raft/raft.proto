@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package raft;
+option go_package = "github.com/AndrewSerra/fs-sync/raft";
+
+service Consensus {
+    rpc RequestVote(VoteRequest) returns (VoteResponse) {}
+    rpc AppendEntries() returns () {}
+}
+
+message VoteRequest {
+    int64 term = 1;
+    string candidateId = 2;
+    int64 lastLogIndex = 3;
+    int64 lastLogTerm = 4;
+}
+
+message VoteResponse {
+    int64 term = 1;
+    bool voteGranted = 2;
+}
+
+message Entry {
+
+}
+
+message AppendEntriesRequest {
+    int64 term = 1;
+    string leaderId = 2;
+    int64 prevLogIndex = 3;
+    int64 prevLogTerm = 4;
+    repeated Entry entries = 5;
+    int64 leaderCommit = 6;
+}
+
+message AppendEntriesResponse {
+    int64 term = 1;
+    bool success = 2;
+}

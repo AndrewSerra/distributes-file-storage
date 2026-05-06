@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	pb "github.com/AndrewSerra/fs-sync/gen/proto"
+	pb "github.com/AndrewSerra/fs-sync/gen/proto/file"
 	"github.com/AndrewSerra/fs-sync/internal/chunk"
 )
 
