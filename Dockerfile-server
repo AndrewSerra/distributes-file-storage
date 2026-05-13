@@ -1,0 +1,20 @@
+FROM golang:1.26.3-bookworm AS builder
+
+WORKDIR /workspace
+
+COPY go.mod go.sum ./
+
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o bin/fs-sync-server ./cmd/server
+
+FROM alpine:3.23
+
+WORKDIR /app
+
+COPY --from=builder /workspace/bin/fs-sync-server .
+
+ENTRYPOINT ["/app/fs-sync-server"]
+

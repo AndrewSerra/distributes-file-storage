@@ -1,0 +1,50 @@
+services:
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile-server
+    command:
+      - --node-id=node1
+      - --port=3456
+      - --peer=node2/node2:3456
+      - --peer=node3/node3:3456
+      - --storage-path=/var/fs-sync/storage
+    ports:
+      - "3456:3456"
+    volumes:
+      - node1-storage:/var/fs-sync/storage
+
+  node2:
+    build:
+      context: .
+      dockerfile: Dockerfile-server
+    command:
+      - --node-id=node2
+      - --port=3456
+      - --peer=node1/node1:3456
+      - --peer=node3/node3:3456
+      - --storage-path=/var/fs-sync/storage
+    ports:
+      - "3457:3456"
+    volumes:
+      - node2-storage:/var/fs-sync/storage
+
+  node3:
+    build:
+      context: .
+      dockerfile: Dockerfile-server
+    command:
+      - --node-id=node3
+      - --port=3456
+      - --peer=node1/node1:3456
+      - --peer=node2/node2:3456
+      - --storage-path=/var/fs-sync/storage
+    ports:
+      - "3458:3456"
+    volumes:
+      - node3-storage:/var/fs-sync/storage
+
+volumes:
+  node1-storage:
+  node2-storage:
+  node3-storage:

@@ -5,29 +5,30 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/AndrewSerra/fs-sync/gen/proto/file"
 	"github.com/AndrewSerra/fs-sync/internal/chunk"
 )
 
+var nodes []string
+
+var grpcOpts = []grpc.DialOption{
+	grpc.WithTransportCredentials(insecure.NewCredentials()),
+}
+
 func init() {
 	rootCmd.AddGroup(cmdGroup)
+	rootCmd.PersistentFlags().StringArrayVar(&nodes, "node", nil, "Node address (repeatable); first responding leader is used")
 
-	// var serverHost string
-	// var serverPort int
-
-	// flag.StringVar(&serverHost, "server-host", "localhost", "Host of the server")
-	// flag.IntVar(&serverPort, "server-port", 3456, "Port of server listening at")
-
-	// Command
 	rootCmd.AddCommand(uploadCmd)
 	rootCmd.AddCommand(deleteCmd)
 	rootCmd.AddCommand(downloadCmd)
@@ -54,7 +55,7 @@ var uploadCmd = &cobra.Command{
 }
 
 var deleteCmd = &cobra.Command{
-	Use:     "delete <filename>",
+	Use:     "delete <chunkId>",
 	Short:   "Delete file being stored",
 	GroupID: cmdGroup.ID,
 	Args:    cobra.ExactArgs(1),
@@ -62,7 +63,7 @@ var deleteCmd = &cobra.Command{
 }
 
 var downloadCmd = &cobra.Command{
-	Use:     "download <filename>",
+	Use:     "download <chunkId>",
 	Short:   "Download file being stored",
 	GroupID: cmdGroup.ID,
 	Args:    cobra.ExactArgs(1),
@@ -71,13 +72,52 @@ var downloadCmd = &cobra.Command{
 
 var listCmd = &cobra.Command{
 	Use:     "list",
-	Short:   "list files being stored",
+	Short:   "List files being stored",
 	GroupID: cmdGroup.ID,
 	Args:    cobra.NoArgs,
 	Run:     listCommandHandler,
 }
 
-var client pb.FileSynchronizerClient
+func getNodes() []string {
+	if len(nodes) == 0 {
+		return []string{"localhost:3456"}
+	}
+	return nodes
+}
+
+func dial(addr string) (pb.FileSynchronizerClient, *grpc.ClientConn, error) {
+	conn, err := grpc.NewClient(addr, grpcOpts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pb.NewFileSynchronizerClient(conn), conn, nil
+}
+
+func isNotLeader(err error) bool {
+	return status.Code(err) == codes.FailedPrecondition
+}
+
+// withLeader tries each node in order, retrying on non-leader errors.
+// fn receives a client connected to the leader and must return a non-nil
+// error only for real failures (not FailedPrecondition).
+func withLeader(fn func(pb.FileSynchronizerClient) error) error {
+	for _, addr := range getNodes() {
+		c, conn, err := dial(addr)
+		if err != nil {
+			continue
+		}
+		err = fn(c)
+		conn.Close()
+		if err == nil {
+			return nil
+		}
+		if isNotLeader(err) {
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("no leader found among nodes: %v", getNodes())
+}
 
 func uploadCommandHandler(cmd *cobra.Command, args []string) {
 	fp := args[0]
@@ -89,60 +129,111 @@ func uploadCommandHandler(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	chunkId, err := prepareUpload(client, chunk.PrepareFileMetaData{
+	meta := chunk.PrepareFileMetaData{
 		Filename:  fn,
 		NumChunks: int64(len(chunks)),
-	})
+	}
 
-	if err != nil {
-		fmt.Printf("could not upload: %s\n", err)
+	var chunkId string
+
+	for _, addr := range getNodes() {
+		c, conn, err := dial(addr)
+		if err != nil {
+			continue
+		}
+
+		chunkId, err = prepareUpload(c, meta)
+		if err != nil {
+			conn.Close()
+			if isNotLeader(err) {
+				continue
+			}
+			fmt.Printf("could not upload: %s\n", err)
+			return
+		}
+
+		err = uploadFile(c, chunkId, chunks)
+		conn.Close()
+		if err != nil {
+			fmt.Printf("error uploading file: %s\n", err)
+			return
+		}
+
+		fmt.Printf("upload complete. chunk ID: %s\n", chunkId)
 		return
 	}
 
-	if err := uploadFile(client, chunkId, chunks); err != nil {
-		fmt.Printf("error uploading file: %s", err)
-		return
-	}
-
-	fmt.Printf("upload complete. chunk ID: %s\n", chunkId)
+	fmt.Printf("no leader found among nodes: %v\n", getNodes())
 }
 
 func deleteCommandHandler(cmd *cobra.Command, args []string) {
-	if err := deleteFile(client, args[0]); err != nil {
-		fmt.Printf("error deleting file: %s", err)
+	err := withLeader(func(c pb.FileSynchronizerClient) error {
+		return deleteFile(c, args[0])
+	})
+	if err != nil {
+		fmt.Printf("error deleting file: %s\n", err)
 		return
 	}
-
 	fmt.Println("delete complete.")
 }
 
 func downloadCommandHandler(cmd *cobra.Command, args []string) {
+	var meta chunk.SavedFileMetaData
+	var found bool
 
-	meta, err := prepareDownload(client, args[0])
+	for _, addr := range getNodes() {
+		c, conn, err := dial(addr)
+		if err != nil {
+			continue
+		}
+		meta, err = prepareDownload(c, args[0])
+		conn.Close()
+		if err != nil {
+			continue
+		}
+		found = true
+		break
+	}
 
-	if err != nil {
-		fmt.Printf("error receiving file metadata: %s", err)
+	if !found {
+		fmt.Println("could not find file on any node")
 		return
 	}
 
-	if err := downloadFile(client, meta); err != nil {
-		fmt.Printf("error downloading file: %s", err)
+	for _, addr := range getNodes() {
+		c, conn, err := dial(addr)
+		if err != nil {
+			continue
+		}
+		err = downloadFile(c, meta)
+		conn.Close()
+		if err != nil {
+			continue
+		}
+		fmt.Println("download complete.")
 		return
 	}
-	fmt.Println("download complete.")
+
+	fmt.Println("could not download file from any node")
 }
 
 func listCommandHandler(cmd *cobra.Command, args []string) {
-	data, err := list(client)
-
-	if err != nil {
-		fmt.Printf("could not get item list: %s", err)
+	for _, addr := range getNodes() {
+		c, conn, err := dial(addr)
+		if err != nil {
+			continue
+		}
+		data, err := list(c)
+		conn.Close()
+		if err != nil {
+			continue
+		}
+		for _, item := range data {
+			fmt.Printf("File: %-20s ChunkID: %-20s\n", item.Filename, item.ChunkId)
+		}
 		return
 	}
-
-	for _, item := range data {
-		fmt.Printf("File: %-20s ChunkID: %-20s\n", item.Filename, item.ChunkId)
-	}
+	fmt.Printf("could not reach any node: %v\n", getNodes())
 }
 
 func list(client pb.FileSynchronizerClient) ([]chunk.SavedFileMetaData, error) {
@@ -152,14 +243,11 @@ func list(client pb.FileSynchronizerClient) ([]chunk.SavedFileMetaData, error) {
 	}
 
 	var saved []chunk.SavedFileMetaData
-
 	for _, item := range items.GetItems() {
 		createdAt, err := time.Parse(time.RFC3339Nano, item.GetCreatedAt())
-
 		if err != nil {
 			return nil, err
 		}
-
 		saved = append(saved, chunk.SavedFileMetaData{
 			Filename:  item.GetFilename(),
 			ChunkId:   item.GetChunkId(),
@@ -167,7 +255,6 @@ func list(client pb.FileSynchronizerClient) ([]chunk.SavedFileMetaData, error) {
 			CreatedAt: createdAt,
 		})
 	}
-
 	return saved, nil
 }
 
@@ -176,32 +263,28 @@ func prepareUpload(client pb.FileSynchronizerClient, metadata chunk.PrepareFileM
 		Filename:  metadata.Filename,
 		NumChunks: metadata.NumChunks,
 	})
-
 	if err != nil {
 		return "", err
 	}
-
 	if res.Success {
 		return res.GetChunkId(), nil
-	} else {
-		return "", errors.New(res.GetMessage())
 	}
+	return "", errors.New(res.GetMessage())
 }
 
 func uploadFile(client pb.FileSynchronizerClient, chunkId string, chunks []chunk.FileChunkData) error {
-	ctx := context.TODO()
-	stream, err := client.Upload(ctx)
+	stream, err := client.Upload(context.TODO())
 	if err != nil {
 		return err
 	}
 
-	for _, chunk := range chunks {
+	for _, c := range chunks {
 		if err := stream.Send(&pb.FileChunk{
 			ChunkId:    chunkId,
-			ChunkOrder: int64(chunk.Order),
-			Chunk:      chunk.Chunk,
+			ChunkOrder: int64(c.Order),
+			Chunk:      c.Chunk,
 		}); err != nil {
-			return fmt.Errorf("failed to send chunk number %d", chunk.Order)
+			return fmt.Errorf("failed to send chunk number %d", c.Order)
 		}
 	}
 
@@ -209,41 +292,30 @@ func uploadFile(client pb.FileSynchronizerClient, chunkId string, chunks []chunk
 	if err != nil {
 		return err
 	}
-
 	if !resp.Success {
 		return fmt.Errorf("server rejected upload")
 	}
-
 	return nil
 }
 
 func deleteFile(client pb.FileSynchronizerClient, chunkId string) error {
-	resp, err := client.Delete(context.TODO(), &pb.DeleteRequest{
-		ChunkId: chunkId,
-	})
+	resp, err := client.Delete(context.TODO(), &pb.DeleteRequest{ChunkId: chunkId})
 	if err != nil {
 		return err
 	}
-
 	if !resp.Success {
 		fmt.Printf("Could not delete chunk '%s': %s\n", chunkId, *resp.Message)
-		return nil
 	}
-
 	return nil
 }
 
 func prepareDownload(client pb.FileSynchronizerClient, chunkId string) (chunk.SavedFileMetaData, error) {
-	savedMeta, err := client.PrepareDownload(context.Background(), &pb.DownloadRequest{
-		ChunkId: chunkId,
-	})
-
+	savedMeta, err := client.PrepareDownload(context.Background(), &pb.DownloadRequest{ChunkId: chunkId})
 	if err != nil {
 		return chunk.SavedFileMetaData{}, err
 	}
 
 	createdAt, err := time.Parse(time.RFC3339Nano, savedMeta.GetCreatedAt())
-
 	if err != nil {
 		return chunk.SavedFileMetaData{}, err
 	}
@@ -257,27 +329,22 @@ func prepareDownload(client pb.FileSynchronizerClient, chunkId string) (chunk.Sa
 }
 
 func downloadFile(client pb.FileSynchronizerClient, metadata chunk.SavedFileMetaData) error {
-	stream, err := client.Download(context.Background(), &pb.DownloadRequest{
-		ChunkId: metadata.ChunkId,
-	})
+	stream, err := client.Download(context.Background(), &pb.DownloadRequest{ChunkId: metadata.ChunkId})
 	if err != nil {
 		return err
 	}
 
-	var data = make([]byte, metadata.NumChunks*chunk.ChunkSizeBytes)
-	var totalBytes = 0
+	data := make([]byte, metadata.NumChunks*chunk.ChunkSizeBytes)
+	totalBytes := 0
 
 	for {
 		recvChunk, err := stream.Recv()
-
 		if err == io.EOF {
 			break
 		}
-
 		if err != nil {
 			return err
 		}
-
 		offset := recvChunk.ChunkOrder * chunk.ChunkSizeBytes
 		endIndex := offset + int64(len(recvChunk.GetChunk()))
 		copy(data[offset:endIndex], recvChunk.GetChunk())
@@ -288,21 +355,6 @@ func downloadFile(client pb.FileSynchronizerClient, metadata chunk.SavedFileMeta
 }
 
 func main() {
-	var opts = []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	}
-
-	const serverHost = "localhost"
-	const serverPort = 3456
-
-	grpcClient, err := grpc.NewClient(fmt.Sprintf("%s:%d", serverHost, serverPort), opts...)
-	if err != nil {
-		log.Fatalf("cannot connect to server: %s", err)
-	}
-	defer grpcClient.Close()
-
-	client = pb.NewFileSynchronizerClient(grpcClient)
-
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}

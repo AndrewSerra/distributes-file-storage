@@ -6,24 +6,41 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/AndrewSerra/fs-sync/gen/proto/file"
+	logpb "github.com/AndrewSerra/fs-sync/gen/proto/log"
+	raftpb "github.com/AndrewSerra/fs-sync/gen/proto/raft"
 	"github.com/AndrewSerra/fs-sync/internal/chunk"
-	"github.com/google/uuid"
+	"github.com/AndrewSerra/fs-sync/internal/consensus"
+	"google.golang.org/protobuf/proto"
 )
 
+type peerSlice []string
+
+func (p *peerSlice) String() string {
+	return strings.Join(*p, ", ")
+}
+
+func (p *peerSlice) Set(value string) error {
+	*p = append(*p, value)
+	return nil
+}
+
 var config struct {
+	nodeId      string
+	peers       peerSlice
 	port        int
 	storagePath string
 	dbHost      string
@@ -34,10 +51,10 @@ var storage = map[string]chunk.SavedFileMetaData{}
 var metaPath string
 
 func init() {
+	flag.StringVar(&config.nodeId, "node-id", "", "Node ID (address to reach) to identify server")
+	flag.Var(&config.peers, "peer", "Other servers to communicate and create consensus")
 	flag.IntVar(&config.port, "port", 3456, "Port to listen for gRPC server")
 	flag.StringVar(&config.storagePath, "storage-path", "/var/fs-sync/storage", "A path to store the file chunks")
-	flag.StringVar(&config.dbHost, "db-host", "localhost", "Database host address")
-	flag.IntVar(&config.dbPort, "db-port", 5432, "Database port")
 
 	flag.Parse()
 
@@ -55,6 +72,17 @@ func init() {
 
 type fileSyncServer struct {
 	pb.UnimplementedFileSynchronizerServer
+	raft *raftServer
+}
+
+func saveStateLog(state *consensus.ServerState, outfile string) error {
+	var data []byte
+
+	for _, logItem := range state.GetLog() {
+		data = append(data, logItem.GetCommand()...)
+	}
+
+	return os.WriteFile(outfile, data, os.ModePerm)
 }
 
 func getInvalidParamString(message string) string {
@@ -99,257 +127,309 @@ func getMetaFilePath(chunkId string) string {
 	return fmt.Sprintf("%s/%s.json", metaPath, chunkId)
 }
 
-func (s *fileSyncServer) List(context context.Context, req *pb.ListRequest) (*pb.ListResponse, error) {
-	files, err := os.ReadDir(metaPath)
-	if err != nil {
-		return nil, err
+func getRandomTickerTime(min int64, max int64) time.Duration {
+	return time.Millisecond * time.Duration(int64(rand.IntN(int(max-min)))+min)
+}
+
+func toLogEntries(entries []*raftpb.Entry) []consensus.LogEntry {
+	out := make([]consensus.LogEntry, len(entries))
+	for i, e := range entries {
+		out[i] = e
 	}
+	return out
+}
 
-	var items []*pb.SavedFileMetaData
+func toPbEntries(entries []consensus.LogEntry) []*raftpb.Entry {
+	var retEntries []*raftpb.Entry
 
-	for _, file := range files {
-		if file.IsDir() {
-			return nil, errors.New("found directory in metadata directory")
-		}
-
-		data, err := os.ReadFile(fmt.Sprintf("%s/%s", metaPath, file.Name()))
-		if err != nil {
-			return nil, err
-		}
-
-		var metadata chunk.SavedFileMetaData
-		if err := json.Unmarshal(data, &metadata); err != nil {
-			return nil, err
-		}
-		items = append(items, &pb.SavedFileMetaData{
-			Filename:  metadata.Filename,
-			ChunkId:   metadata.ChunkId,
-			NumChunks: metadata.NumChunks,
-			CreatedAt: metadata.CreatedAt.Format(time.RFC3339Nano),
+	for _, entry := range entries {
+		retEntries = append(retEntries, &raftpb.Entry{
+			Term:    entry.GetTerm(),
+			Command: entry.GetCommand(),
 		})
 	}
 
-	return &pb.ListResponse{
-		Items: items,
-	}, nil
+	return retEntries
 }
 
-func (s *fileSyncServer) PrepareUpload(context context.Context, req *pb.FileMetaData) (*pb.PrepareUploadResponse, error) {
-	if strings.Trim(req.GetFilename(), " ") == "" {
-		return &pb.PrepareUploadResponse{
-			Success: false,
-			Payload: &pb.PrepareUploadResponse_Message{
-				Message: getInvalidParamString("empty filename"),
-			},
-		}, nil
-	}
+func parsePeerArgs(peerList []string) (map[string]string, error) {
+	peers := map[string]string{}
 
-	if req.GetNumChunks() <= 0 {
-		return &pb.PrepareUploadResponse{
-			Success: false,
-			Payload: &pb.PrepareUploadResponse_Message{
-				Message: getInvalidParamString("non-positive number of chunks"),
-			},
-		}, nil
-	}
-
-	_, err := os.ReadDir(metaPath)
-
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			if err := os.MkdirAll(metaPath, os.ModePerm); err != nil {
-				return nil, err
-			}
-		} else {
-			return &pb.PrepareUploadResponse{
-				Success: false,
-				Payload: &pb.PrepareUploadResponse_Message{
-					Message: fmt.Sprintf("could not open file: %s", err),
-				},
-			}, nil
+	for _, item := range peerList {
+		peer := strings.Split(item, "/")
+		if len(peer) != 2 {
+			return nil, errors.New("invalid peer format, must be <nodename>/<address>")
 		}
+		peers[peer[0]] = peer[1]
 	}
 
-	chunkId := uuid.NewString()
-	metaFilePath := fmt.Sprintf("%s/%s.json", metaPath, chunkId)
-	incomingdata := chunk.SavedFileMetaData{
-		Filename:  req.Filename,
-		ChunkId:   chunkId,
-		NumChunks: req.GetNumChunks(),
-		CreatedAt: time.Now(),
-	}
-
-	data, err := json.Marshal(incomingdata)
-	if err != nil {
-		return nil, err
-	}
-
-	chunkStoragePath := getChunkDirPath(chunkId)
-
-	if err := os.MkdirAll(chunkStoragePath, os.ModePerm); err != nil {
-		return nil, err
-	}
-
-	if err := os.WriteFile(metaFilePath, data, os.ModePerm); err != nil {
-		return nil, err
-	}
-
-	storage[chunkId] = incomingdata
-
-	return &pb.PrepareUploadResponse{
-		Success: true,
-		Payload: &pb.PrepareUploadResponse_ChunkId{
-			ChunkId: chunkId,
-		},
-	}, nil
+	return peers, nil
 }
 
-func (s *fileSyncServer) Upload(stream grpc.ClientStreamingServer[pb.FileChunk, pb.UploadResponse]) error {
+type raftServer struct {
+	raftpb.UnimplementedConsensusServer
+	state           *consensus.ServerState
+	electionTicker  *time.Ticker
+	heartbeatTicker *time.Ticker
 
-	for {
-		chunk, err := stream.Recv()
+	mu sync.Mutex
+}
 
-		chunkStoragePath := getChunkDirPath(chunk.GetChunkId())
+func (s *raftServer) sendAppendRequest(ctx context.Context, wg *sync.WaitGroup, peerId string) error {
+	defer wg.Done()
 
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		log.Printf("Received chunk number %d, size %d\n", chunk.ChunkOrder, len(chunk.Chunk))
-
-		fullFilePath := fmt.Sprintf("%s/%s.%d.chunk", chunkStoragePath, chunk.GetChunkId(), chunk.GetChunkOrder())
-		if err := os.WriteFile(fullFilePath, chunk.GetChunk(), os.ModePerm); err != nil {
-			log.Panicf("Could not write chunk file '%s': %s", fullFilePath, err)
-		}
+	var opts = []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	}
 
-	if err := stream.SendAndClose(&pb.UploadResponse{
-		Success: true,
-	}); err != nil {
-		log.Printf("could not send upload response: %s", err)
+	peerAddr, err := s.state.GetPeerAddr(peerId)
+	if err != nil {
 		return err
 	}
 
-	return nil
-}
-
-func (s *fileSyncServer) Delete(context context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
-	dirpath := getChunkDirPath(req.GetChunkId())
-	metaFilePath := getMetaFilePath(req.GetChunkId())
-	_, err := os.ReadDir(dirpath)
-
+	grpcClient, err := grpc.NewClient(peerAddr, opts...)
 	if err != nil {
-		var msg string
-		if errors.Is(err, os.ErrNotExist) {
-			msg = "does not exist"
-		} else {
-			msg = "cannot open directory"
-		}
-		return &pb.DeleteResponse{
-			Success: false,
-			Message: &msg,
-		}, nil
+		return err
 	}
 
-	if err := os.RemoveAll(dirpath); err != nil {
-		var msg = "could not delete stored path"
-		return &pb.DeleteResponse{
-			Success: false,
-			Message: &msg,
-		}, nil
-	}
+	client := raftpb.NewConsensusClient(grpcClient)
 
-	if err := os.Remove(metaFilePath); err != nil {
-		var msg = "could not delete metadata file"
-		return &pb.DeleteResponse{
-			Success: false,
-			Message: &msg,
-		}, nil
-	}
-
-	return &pb.DeleteResponse{
-		Success: true,
-	}, nil
-}
-
-func (s *fileSyncServer) PrepareDownload(context context.Context, req *pb.DownloadRequest) (*pb.SavedFileMetaData, error) {
-	metaFilePath := getMetaFilePath(req.GetChunkId())
-
-	var meta chunk.SavedFileMetaData
-
-	data, err := os.ReadFile(metaFilePath)
+	prevLogIndex, err := s.state.GetPeerNextIndex(peerId)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	prevLogIndex -= 1
 
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return nil, err
-	}
-
-	return &pb.SavedFileMetaData{
-		Filename:  meta.Filename,
-		ChunkId:   meta.ChunkId,
-		NumChunks: meta.NumChunks,
-		CreatedAt: meta.CreatedAt.Format(time.RFC3339Nano),
-	}, nil
-}
-
-func (s *fileSyncServer) Download(req *pb.DownloadRequest, stream grpc.ServerStreamingServer[pb.FileChunk]) error {
-	dirpath := getChunkDirPath(req.GetChunkId())
-	files, err := os.ReadDir(dirpath)
-
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return errors.New("does not exist")
-		} else {
-			return errors.New("cannot open directory")
-		}
-	}
-
-	for _, file := range files {
-		if file.IsDir() {
-			log.Printf("found '%s' in chunk '%s' directory which is not a file", file.Name(), req.GetChunkId())
-			continue
-		}
-
-		filenameSections := strings.Split(file.Name(), ".")
-		orderNumber, err := strconv.Atoi(filenameSections[len(filenameSections)-2])
-
+	var prevLogTerm int64
+	if prevLogIndex >= 0 {
+		prevLogTerm, err = s.state.GetLogTermAt(prevLogIndex)
 		if err != nil {
 			return err
 		}
-
-		data, err := os.ReadFile(fmt.Sprintf("%s/%s", dirpath, file.Name()))
-
-		if err != nil {
-			return err
-		}
-
-		fmt.Printf("chunk %s : sending number %d\n", req.GetChunkId(), orderNumber)
-
-		if err := stream.Send(&pb.FileChunk{
-			ChunkOrder: int64(orderNumber),
-			Chunk:      data,
-		}); err != nil {
-			return err
-		}
 	}
 
+	entries := s.state.GetLogEntriesFrom(prevLogIndex + 1)
+
+	rpcCtx, cancel := context.WithTimeout(ctx, time.Millisecond*time.Duration(consensus.HeartbeatTimeoutMS*2))
+	defer cancel()
+
+	res, err := client.AppendEntries(rpcCtx, &raftpb.AppendEntriesRequest{
+		Term:         s.state.GetCurrentTerm(),
+		LeaderId:     s.state.GetId(),
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      toPbEntries(entries),
+		LeaderCommit: s.state.GetCommitIndex(),
+	})
+	if err != nil {
+		return err
+	}
+
+	if res.GetTerm() > s.state.GetCurrentTerm() {
+		s.state.BecomeFollower(res.GetTerm())
+		return nil
+	}
+
+	s.state.UpdatePeerAfterAppend(peerId, prevLogIndex+1+int64(len(entries)), res.GetSuccess())
 	return nil
 }
 
-func newServer() *fileSyncServer {
-	syncServer := &fileSyncServer{}
-	return syncServer
+func (s *raftServer) RunElectionTicker(ctx context.Context) {
+	s.electionTicker = time.NewTicker(getRandomTickerTime(consensus.MinElectionTimeoutMS, consensus.MaxElectionTimeoutMS))
+	defer s.electionTicker.Stop()
+
+	for {
+		select {
+		case <-s.electionTicker.C:
+			if s.state.GetRole() != consensus.Leader {
+				s.state.StartElection()
+				go s.runElection(ctx)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *raftServer) RunApplyLoop(ctx context.Context) {
+	for {
+		select {
+		case cmd := <-s.state.ApplyCh:
+			var command logpb.Command
+			if err := proto.Unmarshal(cmd, &command); err != nil {
+				log.Printf("failed to unmarshal command: %s", err)
+				continue
+			}
+			switch op := command.Operation.(type) {
+			case *logpb.Command_FileAdd:
+				applyFileAdd(op.FileAdd)
+			case *logpb.Command_FileDelete:
+				applyFileDelete(op.FileDelete)
+			case *logpb.Command_PeerJoin:
+				s.state.AddPeer(op.PeerJoin.GetPeerId(), op.PeerJoin.GetAddress())
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func applyFileAdd(cmd *logpb.FileAddCommand) {
+	chunkDir := getChunkDirPath(cmd.GetChunkId())
+	if err := os.MkdirAll(chunkDir, os.ModePerm); err != nil {
+		log.Printf("applyFileAdd: could not create dir: %s", err)
+		return
+	}
+
+	for i, chunkData := range cmd.GetChunks() {
+		path := fmt.Sprintf("%s/%s.%d.chunk", chunkDir, cmd.GetChunkId(), i)
+		if err := os.WriteFile(path, chunkData, os.ModePerm); err != nil {
+			log.Printf("applyFileAdd: could not write chunk %d: %s", i, err)
+			return
+		}
+	}
+
+	meta := chunk.SavedFileMetaData{
+		Filename:  cmd.GetFilename(),
+		ChunkId:   cmd.GetChunkId(),
+		NumChunks: cmd.GetNumChunks(),
+		CreatedAt: time.Now(),
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		log.Printf("applyFileAdd: could not marshal metadata: %s", err)
+		return
+	}
+	if err := os.WriteFile(getMetaFilePath(cmd.GetChunkId()), data, os.ModePerm); err != nil {
+		log.Printf("applyFileAdd: could not write metadata: %s", err)
+		return
+	}
+	storage[cmd.GetChunkId()] = meta
+}
+
+func applyFileDelete(cmd *logpb.FileDeleteCommand) {
+	if err := os.RemoveAll(getChunkDirPath(cmd.GetChunkId())); err != nil {
+		log.Printf("applyFileDelete: could not remove chunks: %s", err)
+		return
+	}
+	if err := os.Remove(getMetaFilePath(cmd.GetChunkId())); err != nil {
+		log.Printf("applyFileDelete: could not remove metadata: %s", err)
+		return
+	}
+	delete(storage, cmd.GetChunkId())
+}
+
+func (s *raftServer) RunHeartbeatTicker(ctx context.Context) {
+	s.heartbeatTicker = time.NewTicker(time.Millisecond * time.Duration(consensus.HeartbeatTimeoutMS))
+	defer s.heartbeatTicker.Stop()
+
+	for {
+		select {
+		case <-s.heartbeatTicker.C:
+			if s.state.GetRole() != consensus.Leader {
+				return
+			}
+			var wg sync.WaitGroup
+			for _, peerId := range s.state.GetPeerIds() {
+				wg.Add(1)
+				go s.sendAppendRequest(ctx, &wg, peerId)
+			}
+			wg.Wait()
+			s.state.TryAdvanceCommitIndex()
+			s.state.DrainApplied()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *raftServer) runElection(ctx context.Context) error {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	voteGranted := 1
+
+	var opts = []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	}
+
+	sendVoteRequest := func(peerId string) {
+		defer wg.Done()
+
+		peerAddr, err := s.state.GetPeerAddr(peerId)
+		if err != nil {
+			return
+		}
+
+		grpcClient, err := grpc.NewClient(peerAddr, opts...)
+		if err != nil {
+			return
+		}
+
+		client := raftpb.NewConsensusClient(grpcClient)
+
+		rpcCtx, cancel := context.WithTimeout(ctx, time.Millisecond*time.Duration(consensus.MinElectionTimeoutMS))
+		defer cancel()
+
+		res, err := client.RequestVote(rpcCtx, &raftpb.VoteRequest{
+			Term:         s.state.GetCurrentTerm(),
+			CandidateId:  s.state.GetId(),
+			LastLogIndex: s.state.GetLastLogIndex(),
+			LastLogTerm:  s.state.GetLastLogTerm(),
+		})
+
+		if err != nil {
+			return
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if res.GetTerm() == s.state.GetCurrentTerm() && res.GetVoteGranted() {
+			voteGranted += 1
+		}
+	}
+
+	for _, peer := range s.state.GetPeerIds() {
+		wg.Add(1)
+		go sendVoteRequest(peer)
+	}
+
+	wg.Wait()
+
+	total := len(s.state.GetPeerIds()) + 1
+	majority := total / 2
+
+	if voteGranted > majority {
+		s.state.BecomeLeader()
+		log.Printf("ELECTED LEADER for term %d\n", s.state.GetCurrentTerm())
+		s.electionTicker.Stop()
+		go s.RunHeartbeatTicker(ctx)
+	}
+
+	return nil
 }
 
 func main() {
+	log.Printf("NODE ID: %s\n", config.nodeId)
 	log.Printf("PORT: %d\n", config.port)
 	log.Printf("STORAGE PATH: %s\n", config.storagePath)
 
-	lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", config.port))
+	log.Printf("Peer list:\n")
+	if len(config.peers) == 0 {
+		log.Println("No peers listed")
+	}
+
+	peers, err := parsePeerArgs(config.peers)
+
+	if err != nil {
+		log.Fatalf("failed to parse peers: %v", err)
+	}
+
+	for _, peer := range peers {
+		log.Printf(" - %s\n", peer)
+	}
+
+	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", config.port))
 
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
@@ -362,13 +442,37 @@ func main() {
 	var opts []grpc.ServerOption
 	grpcServer := grpc.NewServer(opts...)
 
-	pb.RegisterFileSynchronizerServer(grpcServer, newServer())
+	raftServer := &raftServer{
+		state: consensus.NewServerState(config.nodeId, peers),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	pb.RegisterFileSynchronizerServer(grpcServer, &fileSyncServer{raft: raftServer})
+	raftpb.RegisterConsensusServer(grpcServer, raftServer)
 	go grpcServer.Serve(lis)
+	go raftServer.RunElectionTicker(ctx)
+	go raftServer.RunApplyLoop(ctx)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	cancel()
 
 	log.Println("Received termination signal, exiting gracefully.")
 	grpcServer.GracefulStop()
+
+	currPath, err := os.Getwd()
+	if err != nil {
+		log.Fatalln(err)
+		return
+	}
+	outfileDir := fmt.Sprintf("%s/logs", currPath)
+	if err := os.MkdirAll(outfileDir, os.ModePerm); err != nil {
+		log.Fatalln(err)
+		return
+	}
+
+	outfilePath := fmt.Sprintf("%s/%s_%s.log", outfileDir, config.nodeId, time.Now().Format("20060102T150405"))
+	saveStateLog(raftServer.state, outfilePath)
 }

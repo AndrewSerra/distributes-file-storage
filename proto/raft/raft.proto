@@ -1,11 +1,11 @@
 syntax = "proto3";
 
 package raft;
-option go_package = "github.com/AndrewSerra/fs-sync/raft";
+option go_package = "github.com/AndrewSerra/fs-sync/gen/proto/raft";
 
 service Consensus {
     rpc RequestVote(VoteRequest) returns (VoteResponse) {}
-    rpc AppendEntries() returns () {}
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse) {}
 }
 
 message VoteRequest {
@@ -21,7 +21,8 @@ message VoteResponse {
 }
 
 message Entry {
-
+    int64 term = 1;
+    bytes command = 2;
 }
 
 message AppendEntriesRequest {

@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package log;
+option go_package = "github.com/AndrewSerra/fs-sync/gen/proto/log";
+
+message Command {
+    oneof operation {
+        FileAddCommand fileAdd = 1;
+        FileDeleteCommand fileDelete = 2;
+        PeerJoinCommand peerJoin = 3;
+    }
+}
+
+message FileAddCommand {
+    string filename = 1;
+    string chunkId = 2;
+    int64 numChunks = 3;
+    repeated bytes chunks = 4;
+}
+
+message FileDeleteCommand {
+    string chunkId = 1;
+}
+
+message PeerJoinCommand {
+    string peerId = 1;
+    string address = 2;
+}
